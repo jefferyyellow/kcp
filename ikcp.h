@@ -19,6 +19,7 @@
 
 //=====================================================================
 // 32BIT INTEGER DEFINITION 
+// 32位int和uint的定义
 //=====================================================================
 #ifndef __INTEGER_32_BITS__
 #define __INTEGER_32_BITS__
@@ -58,6 +59,7 @@
 
 //=====================================================================
 // Integer Definition
+// 各种整数的定义
 //=====================================================================
 #ifndef __IINT8_DEFINED
 #define __IINT8_DEFINED
@@ -129,11 +131,12 @@ typedef unsigned long long IUINT64;
 
 
 //=====================================================================
-// QUEUE DEFINITION                                                  
+// QUEUE DEFINITION
+// 队列的定义                                                  
 //=====================================================================
 #ifndef __IQUEUE_DEF__
 #define __IQUEUE_DEF__
-
+// 队列的定义，类似一个双向链表
 struct IQUEUEHEAD {
 	struct IQUEUEHEAD *next, *prev;
 };
@@ -148,38 +151,49 @@ typedef struct IQUEUEHEAD iqueue_head;
 #define IQUEUE_HEAD(name) \
 	struct IQUEUEHEAD name = IQUEUE_HEAD_INIT(name)
 
+// 初始化队列，将next和prev都指向自己
 #define IQUEUE_INIT(ptr) ( \
 	(ptr)->next = (ptr), (ptr)->prev = (ptr))
 
+// 获取成员在结构体中的偏移
 #define IOFFSETOF(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
 
+// 将指向结构体中成员的指针还原成执行结构体的指针
 #define ICONTAINEROF(ptr, type, member) ( \
 		(type*)( ((char*)((type*)ptr)) - IOFFSETOF(type, member)) )
 
+// 将队列节点指针转换成结构体指针
 #define IQUEUE_ENTRY(ptr, type, member) ICONTAINEROF(ptr, type, member)
 
 
 //---------------------------------------------------------------------
-// queue operation                     
+// queue operation    
+// 队列操作，这个队列有一个头结点head用于管理队列，并且使用双向链表构造的是一个环状队列              
 //---------------------------------------------------------------------
+// 在队列头增加节点
 #define IQUEUE_ADD(node, head) ( \
 	(node)->prev = (head), (node)->next = (head)->next, \
 	(head)->next->prev = (node), (head)->next = (node))
 
+// 在队列尾增加节点
 #define IQUEUE_ADD_TAIL(node, head) ( \
 	(node)->prev = (head)->prev, (node)->next = (head), \
 	(head)->prev->next = (node), (head)->prev = (node))
 
+// 删除p和n之间的节点
 #define IQUEUE_DEL_BETWEEN(p, n) ((n)->prev = (p), (p)->next = (n))
 
+// 删除节点
 #define IQUEUE_DEL(entry) (\
 	(entry)->next->prev = (entry)->prev, \
 	(entry)->prev->next = (entry)->next, \
 	(entry)->next = 0, (entry)->prev = 0)
 
+// 删除节点，并且将删除的节点初始化
 #define IQUEUE_DEL_INIT(entry) do { \
 	IQUEUE_DEL(entry); IQUEUE_INIT(entry); } while (0)
 
+// 队列是否为空
 #define IQUEUE_IS_EMPTY(entry) ((entry) == (entry)->next)
 
 #define iqueue_init		IQUEUE_INIT
