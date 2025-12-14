@@ -283,7 +283,7 @@ typedef struct IQUEUEHEAD iqueue_head;
 struct IKCPSEG
 {
 	struct IQUEUEHEAD node; 	// 链表节点，用于挂到各种队列中（snd_buf、rcv_buf…）
-	IUINT32 conv;				// 会话号（会话唯一标识）
+	IUINT32 conv;				// 会话ID（会话唯一标识）
 	IUINT32 cmd;				// KCP命令类型（IKCP_CMD_PUSH / ACK / WASK / WINS）
 	IUINT32 frg;				// 分片序号（最后一个分片为0；如果整个消息只有一个分片，也为0）
 	IUINT32 wnd;				// 对端剩余窗口大小

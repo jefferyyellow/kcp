@@ -1044,6 +1044,7 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 
 //---------------------------------------------------------------------
 // ikcp_encode_seg
+// 编码分片
 //---------------------------------------------------------------------
 static char *ikcp_encode_seg(char *ptr, const IKCPSEG *seg)
 {
@@ -1058,6 +1059,7 @@ static char *ikcp_encode_seg(char *ptr, const IKCPSEG *seg)
 	return ptr;
 }
 
+// 接受窗口的剩余
 static int ikcp_wnd_unused(const ikcpcb *kcp)
 {
 	if (kcp->nrcv_que < kcp->rcv_wnd) {
@@ -1285,29 +1287,62 @@ void ikcp_flush(ikcpcb *kcp)
 // ikcp_check when to call it again (without ikcp_input/_send calling).
 // 'current' - current timestamp in millisec. 
 //---------------------------------------------------------------------
+//---------------------------------------------------------------------
+// update state (call it repeatedly, every 10ms-100ms), or you can ask 
+// ikcp_check when to call it again (without ikcp_input/_send calling).
+// ('更新状态（重复调用，每 10ms-100ms 一次），或者你可以询问 ikcp_check 
+//  何时再次调用（当没有 ikcp_input 或 ikcp_send 调用时）。')
+//
+// 'current' - current timestamp in millisec. 
+// ('current' - 当前时间戳，单位毫秒。)
+//---------------------------------------------------------------------
+// 函数名：ikcp_update
+// 作用：KCP 协议栈的主时钟和状态更新函数。负责触发刷新（flush）逻辑
+// 参数：
+//   kcp:        ikcpcb 结构体指针，代表当前的 KCP 控制块实例
+//   current:    当前的时间（毫秒）
+// 返回值：
+//   无 (void)
 void ikcp_update(ikcpcb *kcp, IUINT32 current)
 {
 	IINT32 slap;
-
+	// --- 1. 初始化 KCP 时间戳 ---
 	kcp->current = current;
 
+	// 如果是第一次调用 ikcp_update：
 	if (kcp->updated == 0) {
+		// 设置更新标志为已初始化
 		kcp->updated = 1;
+		// 将下一次flush的时间戳初始化为当前时间
 		kcp->ts_flush = kcp->current;
 	}
 
+	// --- 2. 计算距离下一次flush的时间差 ---
 	slap = _itimediff(kcp->current, kcp->ts_flush);
 
+
+	// --- 3. 处理时间回绕问题 (Time Wrap Around) ---
+    // 检查时间差是否异常大（> 10000ms 或 < -10000ms），防止32位时间戳回绕导致计算错误。
 	if (slap >= 10000 || slap < -10000) {
 		kcp->ts_flush = kcp->current;
 		slap = 0;
 	}
 
+// --- 4. 触发 ikcp_flush 逻辑 ---
+    // 如果时间差 slap >= 0，说明当前时间已经到达或超过了预定的ts_flush时间点。
 	if (slap >= 0) {
+		// A. 预定下一次 flush 的时间点：
+        // ts_flush = ts_flush (旧) + interval (周期，如 10ms)
 		kcp->ts_flush += kcp->interval;
+
+		// B. 补偿时间漂移：防止多次调用 ikcp_update 导致 ts_flush 过于超前。
+        // 如果当前时间仍然大于或等于新的 ts_flush（即系统调用 ikcp_update 的频率太慢）：
 		if (_itimediff(kcp->current, kcp->ts_flush) >= 0) {
 			kcp->ts_flush = kcp->current + kcp->interval;
 		}
+		
+		// C. 执行核心刷新操作：
+        // 核心函数，负责检查和发送待发送的数据包、处理 ACK、计算 RTO 和重传逻辑。
 		ikcp_flush(kcp);
 	}
 }
@@ -1315,58 +1350,93 @@ void ikcp_update(ikcpcb *kcp, IUINT32 current)
 
 //---------------------------------------------------------------------
 // Determine when should you invoke ikcp_update:
+// (确定何时应该调用 ikcp_update:)
 // returns when you should invoke ikcp_update in millisec, if there 
 // is no ikcp_input/_send calling. you can call ikcp_update in that
 // time, instead of call update repeatly.
+// 返回你应该在哪个时间点（毫秒，相对于current）调用ikcp_update。
+// 这里的调用是在没有ikcp_input或ikcp_send发生时调用的。你可以选择在那个返回的时间点调用 ikcp_update，而不是重复轮询。
 // Important to reduce unnacessary ikcp_update invoking. use it to 
 // schedule ikcp_update (eg. implementing an epoll-like mechanism, 
 // or optimize ikcp_update when handling massive kcp connections)
+// (这对于减少不必要的ikcp_update调用非常重要。可以用来调度ikcp_update，
+// 例如实现类似epoll的机制，或者在处理大量KCP连接时进行优化。)
 //---------------------------------------------------------------------
+// 函数名：ikcp_check
+// 作用：计算下一次 ikcp_update() 应该被调用的绝对时间点。
+// 参数：
+//   kcp:        ikcpcb 结构体指针，代表当前的 KCP 控制块实例。
+//   current:    当前的时间（毫秒）。
+// 返回值：
+//   IUINT32: 下一次应该调用ikcp_update的绝对时间（毫秒）。
 IUINT32 ikcp_check(const ikcpcb *kcp, IUINT32 current)
 {
+	// kcp->ts_flush: 上一次ikcp_flush实际被调用的时间戳。
 	IUINT32 ts_flush = kcp->ts_flush;
+	// tm_flush: 距离下一次强制flush(基于 interval) 还有多少时间。初始化为最大值
 	IINT32 tm_flush = 0x7fffffff;
+	// tm_packet: 距离下一个数据包需要重传还有多少时间。初始化为最大值
 	IINT32 tm_packet = 0x7fffffff;
+	// minimal: 两个时间差中的最小值，即最小等待时间
 	IUINT32 minimal = 0;
 	struct IQUEUEHEAD *p;
-
+	// // --- 1. 检查是否已经调用过updated ---
 	if (kcp->updated == 0) {
 		return current;
 	}
 
+	// --- 2. 处理时间回绕问题 (Time Wrap Around) ---
+    // KCP 使用 32 位时间戳，可能会发生回绕。这里检查时间差是否超过 10 秒（10000ms）。
+    // 如果时间差异常大，说明时钟可能发生了跳变或回绕，强制重置 ts_flush。
 	if (_itimediff(current, ts_flush) >= 10000 ||
 		_itimediff(current, ts_flush) < -10000) {
 		ts_flush = current;
 	}
 
+	// --- 3. 检查是否已到强制 flush 时间点 ---
+    // 检查是否已经到达或超过了 ts_flush。
+    // 注意：ts_flush 在 ikcp_update 中会被更新为 current + interval，所以这里判断的是当前时间是否大于或等于 ts_flush。
 	if (_itimediff(current, ts_flush) >= 0) {
 		return current;
 	}
 
+	// --- 4. 计算距离下一次强制flush还有多长时间 ---
+    // tm_flush 是ts_flush（目标时间）与current（当前时间）的差值，即还需要等待的时间
+    // ts_flush 是一个未来的时间点。
 	tm_flush = _itimediff(ts_flush, current);
 
+	// --- 5. 遍历发送缓冲区，寻找下一个需要重传的包 ---
+    // 遍历 kcp 的发送缓冲区 (snd_buf)。
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = p->next) {
 		const IKCPSEG *seg = iqueue_entry(p, const IKCPSEG, node);
 		IINT32 diff = _itimediff(seg->resendts, current);
 		if (diff <= 0) {
 			return current;
 		}
+		// 最小的重传时间
 		if (diff < tm_packet) tm_packet = diff;
 	}
 
+	// --- 6. 确定最小等待时间 (minimal) ---
+    // 最小等待时间=min(下一次强制flush等待时间, 下一个数据包重传等待时间)
 	minimal = (IUINT32)(tm_packet < tm_flush ? tm_packet : tm_flush);
+	// 最终的最小等待时间不能超过kcp的interval设置
+    // 这是为了避免在发送缓冲区空闲时，等待时间被无限拉长（例如 tm_packet=0x7fffffff）
 	if (minimal >= kcp->interval) minimal = kcp->interval;
 
+	// --- 7. 返回下一次调用 ikcp_update 的绝对时间 ---
+    // 返回：当前时间 + 最小等待时间
 	return current + minimal;
 }
 
 
-
+// 设置MTU
 int ikcp_setmtu(ikcpcb *kcp, int mtu)
 {
 	char *buffer;
 	if (mtu < 50 || mtu < (int)IKCP_OVERHEAD) 
 		return -1;
+	// 分配3 * （mtu + kcp头)的大小
 	buffer = (char*)ikcp_malloc((mtu + IKCP_OVERHEAD) * 3);
 	if (buffer == NULL) 
 		return -2;
@@ -1377,6 +1447,7 @@ int ikcp_setmtu(ikcpcb *kcp, int mtu)
 	return 0;
 }
 
+// 设置interval
 int ikcp_interval(ikcpcb *kcp, int interval)
 {
 	if (interval > 5000) interval = 5000;
@@ -1385,32 +1456,73 @@ int ikcp_interval(ikcpcb *kcp, int interval)
 	return 0;
 }
 
+// 作用：设置 KCP 的无延迟模式（Nodelay Mode）和关键参数。
+//       这是 KCP 区别于标准 TCP 的核心优化函数。
+// 参数：
+//   kcp:        ikcpcb 结构体指针，代表当前的 KCP 控制块实例。
+//   nodelay:    是否启用无延迟模式（Nodelay Mode）。
+//               - 0: 经典模式（Classic Mode），类似 TCP 算法，延迟稍高但更稳定。
+//               - 1: 启用无延迟模式，大幅降低 RTO（重传超时），牺牲稳定性换取低延迟。
+//               - 2: 极速模式（Turbo Mode，通常与 fastresend=2 配合使用）。
+//               - 负值: 不修改当前设置。
+//   interval:   内部时钟更新频率（单位：毫秒）。即 ikcp_update() 调用的最小间隔。
+//               - 推荐值是 10ms 或 20ms。
+//               - 负值: 不修改当前设置。
+//   resend:     快速重传模式的参数。
+//               - 0: 关闭快速重传（即等待 RTO 超时）。
+//               - 1: 默认快速重传（收到 3 个重复 ACK 触发）。
+//               - 2: 积极快速重传（收到 2 个重复 ACK 触发）。
+//               - 负值: 不修改当前设置。
+//   nc:         是否关闭拥塞控制（No Congestion Window）。
+//               - 0: 启用拥塞控制（标准 KCP 流程，有 cwnd 限制）。
+//               - 1: 关闭拥塞控制（`kcp->nocwnd = 1`），发包速度只受接收窗口 rwnd 限制。
+//               - 负值: 不修改当前设置。
+// 返回值：
+//   0: 成功设置。
 int ikcp_nodelay(ikcpcb *kcp, int nodelay, int interval, int resend, int nc)
 {
+	// --- 1. 设置延迟模式 (nodelay) ---
 	if (nodelay >= 0) {
 		kcp->nodelay = nodelay;
 		if (nodelay) {
+			// 如果启用无延迟模式（nodelay > 0），将最小重传超时（RTO）设置为 IKCP_RTO_NDL（默认 30ms）。
+            // 极大地缩短了 RTO 周期，使得丢包后能更快地触发重传。
 			kcp->rx_minrto = IKCP_RTO_NDL;	
 		}	
 		else {
+			// 如果关闭无延迟模式（nodelay = 0），将最小RTO 设置为IKCP_RTO_MIN（默认 100ms/200ms）。
+            // 采用更保守的 RTO，类似 TCP，适用于网络拥堵但不丢包的场景。
 			kcp->rx_minrto = IKCP_RTO_MIN;
 		}
 	}
+	// --- 2. 设置内部时钟更新频率 (interval) ---
 	if (interval >= 0) {
+		// 限制 interval 的最大值，避免时钟更新过于稀疏。
 		if (interval > 5000) interval = 5000;
+		// 限制interval的最小值，避免时钟更新过于频繁，消耗过多CPU资源。
+        // 建议值通常是10ms或20ms，这里硬编码了最小10ms的限制。
 		else if (interval < 10) interval = 10;
 		kcp->interval = interval;
 	}
+	// --- 3. 设置快速重传的重复ACK数 (resend) ---
 	if (resend >= 0) {
+		// 存储快速重传的阈值。
+        // kcp->fastresend = 0: 关闭。
+        // kcp->fastresend = 1: 默认（通常是3个重复 ACK）。
+        // kcp->fastresend = 2: 更积极（通常是2个重复ACK）。
 		kcp->fastresend = resend;
 	}
+	// --- 4. 设置是否关闭拥塞控制 (nc/nocwnd) ---
 	if (nc >= 0) {
+		// kcp->nocwnd = 1: 关闭发送窗口（拥塞窗口cwnd）的限制。
+        // 此时发送速率只受接收窗口 rwnd 限制，适用于局域网或对延迟要求极高且网络质量好的场景。
+        // 否则（kcp->nocwnd = 0），发送速率受 min(cwnd, rwnd) 限制。
 		kcp->nocwnd = nc;
 	}
 	return 0;
 }
 
-
+// 设置发送窗口和接收窗口的大小
 int ikcp_wndsize(ikcpcb *kcp, int sndwnd, int rcvwnd)
 {
 	if (kcp) {
@@ -1418,12 +1530,14 @@ int ikcp_wndsize(ikcpcb *kcp, int sndwnd, int rcvwnd)
 			kcp->snd_wnd = sndwnd;
 		}
 		if (rcvwnd > 0) {   // must >= max fragment size
+			// 接收窗口最小也会是IKCP_WND_RCV
 			kcp->rcv_wnd = _imax_(rcvwnd, IKCP_WND_RCV);
 		}
 	}
 	return 0;
 }
 
+// 获取等待发送的数据长度
 int ikcp_waitsnd(const ikcpcb *kcp)
 {
 	return kcp->nsnd_buf + kcp->nsnd_que;
@@ -1431,6 +1545,7 @@ int ikcp_waitsnd(const ikcpcb *kcp)
 
 
 // read conv
+// 读取会话ID
 IUINT32 ikcp_getconv(const void *ptr)
 {
 	IUINT32 conv;
